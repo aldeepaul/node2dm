@@ -51,7 +51,7 @@ function C2DMReceiver(config, connection) {
         };
         var token = msgParts[1];
         var collapseKey = msgParts[2];
-        var notification = msgParts[3];
+        var notification = JSON.parse(msgParts[3]);
 
         var c2dmMessage = new C2DMMessage(token, collapseKey, notification);
         connection.notifyDevice(c2dmMessage);
@@ -70,6 +70,13 @@ function C2DMConnection(config) {
         "path": "/c2dm/send",
         "method": "POST"
     }
+
+    this.gcmServerOptions = {
+        "host": "android.googleapis.com", //https
+        "path": "/gcm/send",
+        "method": "POST"
+    }
+	
 
     this.loginOptions = {
         "host": "www.google.com",
@@ -107,7 +114,7 @@ function C2DMConnection(config) {
         for (var i = 0; i < numMessages; i++) {
             var message = pendingMessages.shift();
             self.submitMessage(message);
-        };
+        }
     }
 
     // clear rate limited every hour
@@ -116,15 +123,15 @@ function C2DMConnection(config) {
     }, 60 * 60 * 1000);
 
     // ensure log-in every 10 seconds
-    function loginIfNotAuthenticated() {
-        if (!self.currentAuthorizationToken) {
-            self.authenticate();
-        }
-    }
+//    function loginIfNotAuthenticated() {
+//        if (!self.currentAuthorizationToken) {
+//            //self.authenticate();
+//        }
+//    }
 
-    setInterval(function() {
-        loginIfNotAuthenticated();
-    }, 5 * 1000);
+//    setInterval(function() {
+//        loginIfNotAuthenticated();
+//    }, 5 * 1000);
 
     this.on('loginComplete', function() {
         self.retryPendingMessages();
@@ -167,7 +174,9 @@ function C2DMConnection(config) {
         var errMessage = err.match(/Error=(.+)$/);
         if (!errMessage) {
             log("Unknown error: " + err);
+            return;
         }
+        
         var googleError = errMessage[1];
         switch (googleError) {
             case "QuotaExceeded":
@@ -203,6 +212,7 @@ function C2DMConnection(config) {
     }
 
     this.sendRequest = function(message) {
+        log('sending msg to google!');
         if (blockedFromSending) {
             self.requeueMessage(message);
             return;
@@ -213,24 +223,26 @@ function C2DMConnection(config) {
         }
 
         var c2dmPostBody = {
-            registration_id: message.deviceToken,
+            registration_ids: [message.deviceToken],
             collapse_key: message.collapseKey,
-            "data.data": message.notification,
+            data: message.notification
         }
 
-        var stringBody = querystring.stringify(c2dmPostBody);
+        var stringBody = JSON.stringify(c2dmPostBody);
+        log(stringBody);
         var requestOptions =  {
-            'host': self.c2dmServerOptions.host,
-            'path': self.c2dmServerOptions.path,
+            'host': self.gcmServerOptions.host,
+            'path': self.gcmServerOptions.path,
             'method': 'POST',
             'headers': {
                 'Content-Length': stringBody.length,
-                'Content-Type': 'application/x-www-form-urlencoded'
+                'Content-Type': 'application/json',
+                'Authorization': 'key='+config.apiKey
             }
         };
-        requestOptions['headers']['Authorization'] = 'GoogleLogin auth=' + self.currentAuthorizationToken;
 
-        var postRequest = https.request(requestOptions, function(response) {
+        var postRequest = https.request(requestOptions, function(response) {  
+            log('response: ' + querystring.stringify(response));
             if (response.statusCode == 401) {
                 // we need to reauthenticate
                 self.currentAuthorizationToken = null;
@@ -244,14 +256,15 @@ function C2DMConnection(config) {
                     blockedFromSending = false;
                     self.emit('retryAfterExpired');
                 }, retryAfter * 1000);
-            } else if (response.statusCode == 200) {
+            } else if (response.statusCode == 200) { 
                 response.setEncoding('utf-8');
                 var buffer = '';
                 response.on('data', function(chunk) {
                     buffer += chunk;
+                    log(buffer);
                 });
                 response.on('end', function(end) {
-                    var returnedID = buffer.match(/id=/);
+                    var returnedID = buffer.match(/\"success\":1/);                    
                     if (!returnedID) {
                         self.onError(message, buffer);
                     }
@@ -269,69 +282,12 @@ function C2DMConnection(config) {
     }
 
     this.submitMessage = function(message) {
-        if (self.currentAuthorizationToken) {
-            self.sendRequest(message);
-        } else {
-            self.requeueMessage(message);
-        }
+        self.sendRequest(message);
     }
 
     this.notifyDevice = function(message) {
         totalMessages++;
         self.submitMessage(message);
-    };
-
-    this.authenticate = function() {
-        if (authInProgress) {
-            return;
-        }
-        if (self.authFails > 10) {
-            log("Could not auth after 10 attempts!");
-            process.exit(1);
-        }
-
-        authInProgress = true;
-
-        var loginBody = {
-            "accountType": "HOSTED_OR_GOOGLE",
-            "Email": config.username,
-            "Passwd": config.password,
-            "service": "ac2dm",
-            "source": config.source
-        }
-        var loginBodyString = querystring.stringify(loginBody);
-        this.loginOptions['headers']['Content-Length'] = loginBodyString.length;
-        var loginReq = https.request(self.loginOptions, function(res) {
-            res.setEncoding('utf-8');
-            var buffer = '';
-            res.on('data', function(data) {
-                buffer += data;
-            });
-            res.on('end', function() {
-                var token = buffer.match(/Auth=(.+)[$|\n]/);
-                if (token) {
-                    self.currentAuthorizationToken = token[1];
-                    authTokenTime = Math.round(new Date().getTime() / 1000);
-                    self.authFails = 0;
-                    self.emit('loginComplete');
-                } else {
-                    log("Auth fail; body: " + buffer);
-                    if (buffer.match(/CaptchaToken/)) {
-                        log("Must auth with captcha; exiting");
-                        process.exit(1);
-                    }
-                    self.authFails++;
-                }
-                log('auth token: ' + self.currentAuthorizationToken);
-                authInProgress = false;
-            });
-        });
-        loginReq.on('error', function(e) {
-            log(e);
-            authInProgress = false;
-        });
-        loginReq.write(loginBodyString);
-        loginReq.end();
     };
 
     this.debugServer = net.createServer(function(stream) {
